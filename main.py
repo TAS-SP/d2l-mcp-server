@@ -1,8 +1,19 @@
 import os
 import httpx
 from fastmcp import FastMCP
+from starlette.middleware.cors import CORSMiddleware
 
 mcp = FastMCP("D2L-v146-Server")
+
+# Enable CORS middleware for Copilot Studio handshake
+app = mcp._mcp_server.app
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 async def get_access_token(client_id: str, client_secret: str, scope: str = "*:*") -> str:
     """Exchange OAuth client credentials for a D2L Bearer Token."""
@@ -22,18 +33,14 @@ async def get_access_token(client_id: str, client_secret: str, scope: str = "*:*
 @mcp.tool()
 async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
     """Fetch user details directly via D2L Brightspace LP API version 1.46."""
-    # Pull credentials securely from Render environment variables
     client_id = os.environ.get("D2L_CLIENT_ID")
     client_secret = os.environ.get("D2L_CLIENT_SECRET")
     domain = domain or os.environ.get("D2L_DOMAIN")
 
     if not client_id or not client_secret or not domain:
-        return {"error": "Missing D2L_CLIENT_ID, D2L_CLIENT_SECRET, or D2L_DOMAIN in Render Environment Variables."}
+        return {"error": "Missing D2L_CLIENT_ID, D2L_CLIENT_SECRET, or D2L_DOMAIN in Render environment."}
 
-    # 1. Fetch token automatically
     bearer_token = await get_access_token(client_id, client_secret)
-    
-    # 2. Query D2L LP API 1.46
     url = f"https://{domain}/d2l/api/lp/1.46/users/"
     headers = {"Authorization": f"Bearer {bearer_token}"}
     params = {"userName": username} if username else {}
