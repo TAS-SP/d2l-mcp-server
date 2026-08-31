@@ -1,19 +1,8 @@
 import os
 import httpx
 from fastmcp import FastMCP
-from starlette.middleware.cors import CORSMiddleware
 
 mcp = FastMCP("D2L-v146-Server")
-
-# Enable CORS middleware for Copilot Studio handshake
-app = mcp._mcp_server.app
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 async def get_access_token(client_id: str, client_secret: str, scope: str = "*:*") -> str:
     """Exchange OAuth client credentials for a D2L Bearer Token."""
