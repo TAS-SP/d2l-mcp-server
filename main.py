@@ -2,17 +2,16 @@ import os
 import httpx
 from fastmcp import FastMCP
 
-# Initialize FastMCP instance
 mcp = FastMCP("D2L-v146-Server")
 
-async def get_access_token(client_id: str, client_secret: str, scope: str = "*:*") -> str:
-    """Exchange OAuth client credentials for a D2L Bearer Token."""
+async def get_access_token(client_id: str, client_secret: str, refresh_token: str) -> str:
+    """Exchange D2L Refresh Token for a Bearer Access Token."""
     token_url = "https://auth.brightspace.com/core/connect/token"
     payload = {
-        "grant_type": "client_credentials",
+        "grant_type": "refresh_token",
         "client_id": client_id,
         "client_secret": client_secret,
-        "scope": scope
+        "refresh_token": refresh_token
     }
     
     async with httpx.AsyncClient() as client:
@@ -25,13 +24,14 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
     """Fetch user details directly via D2L Brightspace LP API version 1.46."""
     client_id = os.environ.get("D2L_CLIENT_ID")
     client_secret = os.environ.get("D2L_CLIENT_SECRET")
+    refresh_token = os.environ.get("D2L_REFRESH_TOKEN")
     domain = domain or os.environ.get("D2L_DOMAIN")
 
-    if not client_id or not client_secret or not domain:
-        return {"error": "Missing D2L_CLIENT_ID, D2L_CLIENT_SECRET, or D2L_DOMAIN in Render environment."}
+    if not all([client_id, client_secret, refresh_token, domain]):
+        return {"error": "Missing D2L credentials in Render environment variables."}
 
     try:
-        bearer_token = await get_access_token(client_id, client_secret)
+        bearer_token = await get_access_token(client_id, client_secret, refresh_token)
         url = f"https://{domain}/d2l/api/lp/1.46/users/"
         headers = {"Authorization": f"Bearer {bearer_token}"}
         params = {"userName": username} if username else {}
