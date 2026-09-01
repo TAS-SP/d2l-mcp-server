@@ -1,8 +1,6 @@
 import os
 import httpx
-import uvicorn
 from fastmcp import FastMCP
-from fastapi.middleware.cors import CORSMiddleware
 
 # Initialize FastMCP instance
 mcp = FastMCP("D2L-v146-Server")
@@ -47,18 +45,6 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
     except Exception as e:
         return {"error": f"An error occurred: {str(e)}"}
 
-# Generate HTTP app
-app = mcp.http_app()
-
-# Enable CORS for Copilot Studio handshake
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    mcp.run(transport="http", host="0.0.0.0", port=port)
