@@ -48,3 +48,26 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     mcp.run(transport="http", host="0.0.0.0", port=port)
+
+
+async def get_access_token(client_id: str, client_secret: str, refresh_token: str) -> str:
+    """Exchange D2L Refresh Token for a Bearer Access Token."""
+    # Guard against accidental JWT entry in Render environment
+    if refresh_token.strip().startswith("eyJ"):
+        raise ValueError(
+            "D2L_REFRESH_TOKEN is currently set to an Access Token (JWT). "
+            "Please replace it in Render with the opaque refresh token from Postman."
+        )
+
+    token_url = "https://auth.brightspace.com/core/connect/token"
+    payload = {
+        "grant_type": "refresh_token",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(token_url, data=payload)
+        response.raise_for_status()
+        return response.json()["access_token"]
