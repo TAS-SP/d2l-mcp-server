@@ -78,7 +78,7 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
     Checks exact match first. If missing, validates similarity scores so unrelated 
     users returned by D2L search are discarded rather than suggested.
     """
-    domain = domain or os.environ.get("D2L_DOMAIN", "sp.brightspace.com")
+    domain = domain or os.environ.get("D2L_DOMAIN", "sptest.brightspace.com")
     clean_user = username.strip()
 
     if not clean_user:
@@ -193,7 +193,7 @@ async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> di
     Returns valid = True ONLY if an exact Code match is found, IsActive is True,
     and IsDeleted is False. Otherwise returns valid = False.
     """
-    domain = domain or os.environ.get("D2L_DOMAIN", "sp.brightspace.com")
+    domain = domain or os.environ.get("D2L_DOMAIN", "sptest.brightspace.com")
     clean_code = module_code.strip()
 
     if not clean_code:
