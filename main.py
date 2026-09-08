@@ -1,6 +1,7 @@
 import os
 import time
 import httpx
+import difflib
 from fastmcp import FastMCP
 
 # Initialize FastMCP Server
@@ -59,9 +60,9 @@ async def get_valid_access_token() -> str:
 @mcp.tool()
 async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
     """
-    Fetch user details (including IsActive status) via D2L Brightspace LP API version 1.46.
-    Checks exact match first (by UserName or Email). If no exact match exists, returns only a single 
-    top similar candidate to confirm identity without exposing internal User IDs or multiple matches.
+    Fetch user details via D2L Brightspace LP API version 1.46.
+    Checks exact match first. If missing, validates similarity scores so unrelated 
+    users returned by D2L search are discarded rather than suggested.
     """
     domain = domain or os.environ.get("D2L_DOMAIN", "sp.brightspace.com")
     clean_user = username.strip()
@@ -124,12 +125,32 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                 )
             }
 
-        # 4. No Exact Match: Return only the single top similar candidate without User ID
-        if items:
-            top_match = items[0]
-            display_name = f"{top_match.get('FirstName', '')} {top_match.get('LastName', '')}".strip()
-            matched_username = top_match.get("UserName")
-            matched_email = top_match.get("EmailAddress")
+        # 4. No Exact Match: Filter candidates by similarity threshold
+        best_candidate = None
+        highest_score = 0.0
+
+        for u in items:
+            u_name = str(u.get("UserName", "")).strip().lower()
+            u_email = str(u.get("EmailAddress", "")).strip().lower()
+
+            # Calculate string similarity ratio against target
+            score_name = difflib.SequenceMatcher(None, target, u_name).ratio()
+            score_email = difflib.SequenceMatcher(None, target, u_email).ratio()
+            max_score = max(score_name, score_email)
+
+            # Boost score if target is a substring or prefix match
+            if target in u_name or target in u_email or u_name.startswith(target):
+                max_score = max(max_score, 0.7)
+
+            if max_score > highest_score:
+                highest_score = max_score
+                best_candidate = u
+
+        # Only suggest candidate if similarity score is at least 45%
+        if best_candidate and highest_score >= 0.45:
+            display_name = f"{best_candidate.get('FirstName', '')} {best_candidate.get('LastName', '')}".strip()
+            matched_username = best_candidate.get("UserName")
+            matched_email = best_candidate.get("EmailAddress")
 
             return {
                 "found": False,
@@ -140,7 +161,7 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                     "email": matched_email
                 },
                 "status_message": f"Exact match for '{clean_user}' not found.",
-                "instruction": f"Ask the user: 'Exact match not found. Did you mean {display_name} ({matched_username})?'"
+                "instruction": f"Ask the user: 'Exact match for {clean_user} not found. Did you mean {display_name} ({matched_username})?'"
             }
 
         return {
@@ -219,19 +240,16 @@ async def validate_d2l_module_146(org_unit_identifier: str, domain: str = "") ->
         # 4. No Exact Match: Perform fallback candidate search
         candidates_raw = []
         async with httpx.AsyncClient() as client:
-            # Step 4A: Partial match on Code column
             res = await client.get(search_url, headers=headers, params={"orgUnitCode": clean_code})
             if res.status_code == 200:
                 candidates_raw = res.json().get("Items", [])
 
-            # Step 4B: If 0 results and code contains separator (e.g. MA1108-S2010), search by base code prefix (e.g. MA1108)
             if not candidates_raw and ("-" in clean_code or "_" in clean_code):
                 base_prefix = clean_code.replace("_", "-").split("-")[0].strip()
                 res = await client.get(search_url, headers=headers, params={"orgUnitCode": base_prefix})
                 if res.status_code == 200:
                     candidates_raw = res.json().get("Items", [])
 
-            # Step 4C: Broad search fallback if still empty
             if not candidates_raw:
                 res = await client.get(search_url, headers=headers, params={"search": clean_code})
                 if res.status_code == 200:
