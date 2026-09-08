@@ -7,7 +7,7 @@ from fastmcp import FastMCP
 # Initialize FastMCP Server
 mcp = FastMCP("D2L-v146-Server")
 
-# In-memory token cache for Render environment runtime
+# In-memory token cache for Render runtime
 TOKEN_CACHE = {
     "access_token": None,
     "expires_at": 0,
@@ -70,15 +70,15 @@ async def get_d2l_users_146(
     username: str = "",
     user_id: str = "",
     user_name: str = "",
-    domain: str = "",
-    **kwargs
+    user: str = "",
+    domain: str = ""
 ) -> dict:
     """
     Validate if a user exists and is active in D2L strictly against UserName/Email.
-    Accepts aliases (username, user_id, user_name) to prevent agent parameter schema errors.
+    Accepts aliases (username, user_id, user_name, user) to support various caller schemas.
     """
     domain = domain or os.environ.get("D2L_DOMAIN", "sptest.brightspace.com")
-    raw_user = username or user_name or user_id or str(kwargs.get("user", ""))
+    raw_user = username or user_name or user_id or user
     clean_user = raw_user.strip()
 
     if not clean_user:
@@ -173,15 +173,15 @@ async def validate_d2l_module_146(
     module_code: str = "",
     org_unit_identifier: str = "",
     org_unit_code: str = "",
-    domain: str = "",
-    **kwargs
+    code: str = "",
+    domain: str = ""
 ) -> dict:
     """
     Validate a D2L Org Unit / Module STRICTLY against the Code column.
-    Ignores numeric IDs or other attributes for matching. Returns similarity suggestions matching the Code column if failed.
+    Accepts aliases (module_code, org_unit_identifier, org_unit_code, code) to support Composio/Agent parameters.
     """
     domain = domain or os.environ.get("D2L_DOMAIN", "sptest.brightspace.com")
-    raw_code = module_code or org_unit_identifier or org_unit_code or str(kwargs.get("code", ""))
+    raw_code = module_code or org_unit_identifier or org_unit_code or code
     clean_code = raw_code.strip()
 
     if not clean_code:
