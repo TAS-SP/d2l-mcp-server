@@ -20,7 +20,6 @@ async def get_valid_access_token() -> str:
     """
     now = time.time()
     
-    # 1. Reuse active access token if valid (with 60-second safety buffer)
     if TOKEN_CACHE["access_token"] and TOKEN_CACHE["expires_at"] > now + 60:
         return TOKEN_CACHE["access_token"]
 
@@ -31,12 +30,9 @@ async def get_valid_access_token() -> str:
     if not all([client_id, client_secret, refresh_token]):
         raise ValueError("Missing D2L_CLIENT_ID, D2L_CLIENT_SECRET, or D2L_REFRESH_TOKEN environment variables.")
 
-    # Safeguard check to ensure an Access Token JWT was not accidentally set
     if refresh_token.startswith("eyJ"):
         print("LOG ERROR: D2L_REFRESH_TOKEN starts with 'eyJ'. It is an Access Token (JWT), not a Refresh Token.")
         raise ValueError("D2L_REFRESH_TOKEN is set to a JWT Access Token instead of an opaque Refresh Token.")
-    else:
-        print(f"LOG SUCCESS: Refreshing token (Prefix: {refresh_token[:5]}...)")
 
     token_url = "https://auth.brightspace.com/core/connect/token"
     payload = {
@@ -51,11 +47,9 @@ async def get_valid_access_token() -> str:
         response.raise_for_status()
         data = response.json()
 
-        # Update in-memory cache with new access token and expiration time
         TOKEN_CACHE["access_token"] = data["access_token"]
         TOKEN_CACHE["expires_at"] = now + data.get("expires_in", 7200)
         
-        # Persist single-use rotated refresh token in memory
         if "refresh_token" in data:
             TOKEN_CACHE["current_refresh_token"] = data["refresh_token"]
 
@@ -89,74 +83,89 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
 async def validate_d2l_module_146(org_unit_identifier: str, domain: str = "") -> dict:
     """
     Validate if a D2L Org Unit / Module is valid (IsActive is true AND IsDeleted is false).
-    Searches against the Code column (exact match first, then partial match fallback) or by numeric OrgUnit ID,
-    then fetches full record details to accurately capture IsActive status.
+    Checks exact match first. If no exact match exists, searches for related modules and returns candidates to prompt the user.
     """
     domain = domain or os.environ.get("D2L_DOMAIN", "sp.brightspace.com")
+    clean_code = org_unit_identifier.strip()
 
     try:
         bearer_token = await get_valid_access_token()
         headers = {"Authorization": f"Bearer {bearer_token}"}
         
         target_id = None
+        search_url = f"https://{domain}/d2l/api/lp/1.46/orgstructure/"
         
-        # 1. If input is strictly numeric, use directly as OrgUnit ID
-        if org_unit_identifier.isdigit():
-            target_id = org_unit_identifier
+        # 1. Direct ID lookup if input is strictly numeric
+        if clean_code.isdigit():
+            target_id = clean_code
         else:
-            # 2. Search against the Code column to extract the target OrgUnit Identifier
-            search_url = f"https://{domain}/d2l/api/lp/1.46/orgstructure/"
-            
-            # Step 2A: Exact match on Code
+            # 2. Check for Exact Match on Code column
             async with httpx.AsyncClient() as client:
-                res = await client.get(search_url, headers=headers, params={"exactOrgUnitCode": org_unit_identifier})
-                if res.status_code == 200 and res.json().get("Items"):
-                    target_id = res.json()["Items"][0].get("Identifier")
+                res = await client.get(search_url, headers=headers, params={"exactOrgUnitCode": clean_code})
+                if res.status_code == 200:
+                    items = res.json().get("Items", [])
+                    for item in items:
+                        if item.get("Code", "").strip().lower() == clean_code.lower():
+                            target_id = item.get("Identifier")
+                            break
 
-            # Step 2B: Substring match fallback on Code
-            if not target_id:
-                async with httpx.AsyncClient() as client:
-                    res = await client.get(search_url, headers=headers, params={"orgUnitCode": org_unit_identifier})
-                    if res.status_code == 200 and res.json().get("Items"):
-                        target_id = res.json()["Items"][0].get("Identifier")
+        # 3. Exact Match Found: Fetch full course details and return validation status
+        if target_id:
+            detail_url = f"https://{domain}/d2l/api/lp/1.46/courses/{target_id}"
+            async with httpx.AsyncClient() as client:
+                res = await client.get(detail_url, headers=headers)
+                if res.status_code != 200:
+                    detail_url = f"https://{domain}/d2l/api/lp/1.46/orgstructure/{target_id}"
+                    res = await client.get(detail_url, headers=headers)
 
-        if not target_id:
+                res.raise_for_status()
+                org_unit = res.json()
+
+            is_active = org_unit.get("IsActive", False)
+            is_deleted = org_unit.get("IsDeleted", False)
+            is_valid = (is_active is True) and (is_deleted is False)
+
             return {
-                "valid": False,
-                "reason": f"No Org Unit matching Code or ID '{org_unit_identifier}' was found in Brightspace."
+                "valid": is_valid,
+                "exact_match_found": True,
+                "org_unit_id": org_unit.get("Identifier"),
+                "name": org_unit.get("Name"),
+                "code": org_unit.get("Code"),
+                "is_active": is_active,
+                "is_deleted": is_deleted,
+                "status_message": (
+                    f"Module '{org_unit.get('Code')}' is valid (IsActive=True, IsDeleted=False)."
+                    if is_valid
+                    else f"Module '{org_unit.get('Code')}' is INVALID (IsActive={is_active}, IsDeleted={is_deleted})."
+                )
             }
 
-        # 3. Fetch full details to get true IsActive and IsDeleted status
-        detail_url = f"https://{domain}/d2l/api/lp/1.46/courses/{target_id}"
+        # 4. No Exact Match: Run Partial/Fuzzy search to pull up to 5 candidates
+        candidates = []
         async with httpx.AsyncClient() as client:
-            res = await client.get(detail_url, headers=headers)
-            
-            # Fall back to orgstructure detail if item is an org unit type other than a course offering
-            if res.status_code != 200:
-                detail_url = f"https://{domain}/d2l/api/lp/1.46/orgstructure/{target_id}"
-                res = await client.get(detail_url, headers=headers)
+            res = await client.get(search_url, headers=headers, params={"search": clean_code})
+            if res.status_code == 200:
+                items = res.json().get("Items", [])
+                for item in items[:5]:
+                    candidates.append({
+                        "org_unit_id": item.get("Identifier"),
+                        "code": item.get("Code"),
+                        "name": item.get("Name")
+                    })
 
-            res.raise_for_status()
-            org_unit = res.json()
-
-        is_active = org_unit.get("IsActive", False)
-        is_deleted = org_unit.get("IsDeleted", False)
-        
-        # Strict validation condition: IsActive MUST be True AND IsDeleted MUST be False
-        is_valid = (is_active is True) and (is_deleted is False)
+        if candidates:
+            return {
+                "valid": False,
+                "exact_match_found": False,
+                "status_message": f"Exact module code '{clean_code}' was not found. Please select from the candidate list below.",
+                "candidate_modules": candidates,
+                "instruction": "Present these candidate module options (Code and Name) to the user and ask them to confirm which one they meant."
+            }
 
         return {
-            "valid": is_valid,
-            "org_unit_id": org_unit.get("Identifier"),
-            "name": org_unit.get("Name"),
-            "code": org_unit.get("Code"),
-            "is_active": is_active,
-            "is_deleted": is_deleted,
-            "status_message": (
-                f"Module '{org_unit.get('Code')}' is valid (IsActive=True, IsDeleted=False)."
-                if is_valid
-                else f"Module '{org_unit.get('Code')}' is INVALID (IsActive={is_active}, IsDeleted={is_deleted})."
-            )
+            "valid": False,
+            "exact_match_found": False,
+            "reason": f"No Org Unit matching Code or ID '{clean_code}' was found in Brightspace."
         }
         
     except httpx.HTTPStatusError as e:
