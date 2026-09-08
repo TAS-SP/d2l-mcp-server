@@ -1,7 +1,6 @@
 import os
 import time
 import httpx
-import difflib
 from fastmcp import FastMCP
 
 # Initialize FastMCP Server
@@ -21,7 +20,6 @@ async def get_valid_access_token() -> str:
     """
     now = time.time()
     
-    # 1. Reuse existing access token if valid (with 60s safety buffer)
     if TOKEN_CACHE["access_token"] and TOKEN_CACHE["expires_at"] > now + 60:
         return TOKEN_CACHE["access_token"]
 
@@ -47,19 +45,15 @@ async def get_valid_access_token() -> str:
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             response = await client.post(token_url, data=payload)
-            
-            # Print exact D2L auth payload if the request fails
             if response.status_code != 200:
                 print(f"D2L Auth Error Response ({response.status_code}): {response.text}")
                 
             response.raise_for_status()
             data = response.json()
 
-            # Cache the new access token
             TOKEN_CACHE["access_token"] = data["access_token"]
             TOKEN_CACHE["expires_at"] = now + data.get("expires_in", 1800)
             
-            # Save newly rotated refresh token if returned by D2L
             if "refresh_token" in data:
                 TOKEN_CACHE["current_refresh_token"] = data["refresh_token"]
 
@@ -74,15 +68,14 @@ async def get_valid_access_token() -> str:
 @mcp.tool()
 async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
     """
-    Fetch user details via D2L Brightspace LP API version 1.46.
-    Checks exact match first. If missing, validates similarity scores so unrelated 
-    users returned by D2L search are discarded rather than suggested.
+    Validate if a user exists and is active in D2L Brightspace LP API version 1.46.
+    Returns strictly the validation status result without sensitive user metadata.
     """
     domain = domain or os.environ.get("D2L_DOMAIN", "sptest.brightspace.com")
     clean_user = username.strip()
 
     if not clean_user:
-        return {"error": "Username parameter cannot be empty."}
+        return {"valid": False, "status_message": "Username parameter cannot be empty."}
 
     try:
         bearer_token = await get_valid_access_token()
@@ -98,7 +91,6 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                 if not isinstance(items, list):
                     items = []
 
-            # Fallback search if userName parameter returned 0 results
             if not items:
                 response = await client.get(url, headers=headers, params={"query": clean_user})
                 if response.status_code == 200:
@@ -107,7 +99,6 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                     if not isinstance(items, list):
                         items = []
 
-        # 1. Look for an Exact Match on UserName or EmailAddress
         exact_user = None
         target = clean_user.lower()
         for u in items:
@@ -117,81 +108,35 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                 exact_user = u
                 break
 
-        # 2. Exact Match Found: Return detailed user status
         if exact_user:
             activation = exact_user.get("Activation", {})
             is_active = activation.get("IsActive", False) if isinstance(activation, dict) else False
             
-            return {
-                "found": True,
-                "exact_match_found": True,
-                "username": exact_user.get("UserName"),
-                "first_name": exact_user.get("FirstName"),
-                "last_name": exact_user.get("LastName"),
-                "email": exact_user.get("EmailAddress"),
-                "org_defined_id": exact_user.get("OrgDefinedId"),
-                "is_active": is_active,
-                "status_message": (
-                    f"User '{exact_user.get('UserName')}' is ACTIVE."
-                    if is_active
-                    else f"User '{exact_user.get('UserName')}' is INACTIVE."
-                )
-            }
-
-        # 3. Similar Match Fallback (Minimum 45% similarity threshold)
-        best_candidate = None
-        highest_score = 0.0
-
-        for u in items:
-            u_name = str(u.get("UserName", "")).strip().lower()
-            u_email = str(u.get("EmailAddress", "")).strip().lower()
-
-            score_name = difflib.SequenceMatcher(None, target, u_name).ratio()
-            score_email = difflib.SequenceMatcher(None, target, u_email).ratio()
-            max_score = max(score_name, score_email)
-
-            if target in u_name or target in u_email or u_name.startswith(target):
-                max_score = max(max_score, 0.7)
-
-            if max_score > highest_score:
-                highest_score = max_score
-                best_candidate = u
-
-        if best_candidate and highest_score >= 0.45:
-            display_name = f"{best_candidate.get('FirstName', '')} {best_candidate.get('LastName', '')}".strip()
-            matched_username = best_candidate.get("UserName")
-            matched_email = best_candidate.get("EmailAddress")
-
-            return {
-                "found": False,
-                "exact_match_found": False,
-                "similar_match": {
-                    "username": matched_username,
-                    "name": display_name,
-                    "email": matched_email
-                },
-                "status_message": f"Exact match for '{clean_user}' not found.",
-                "instruction": f"Ask the user: 'Exact match for {clean_user} not found. Did you mean {display_name} ({matched_username})?'"
-            }
+            if is_active:
+                return {
+                    "valid": True,
+                    "status_message": f"User '{clean_user}' is VALID."
+                }
+            else:
+                return {
+                    "valid": False,
+                    "status_message": f"User '{clean_user}' is INACTIVE."
+                }
 
         return {
-            "found": False,
-            "exact_match_found": False,
-            "reason": f"No user matching '{clean_user}' was found in Brightspace."
+            "valid": False,
+            "status_message": f"User '{clean_user}' is INVALID."
         }
 
-    except httpx.HTTPStatusError as e:
-        return {"error": f"D2L User API returned HTTP {e.response.status_code}: {e.response.text}"}
     except Exception as e:
-        return {"error": f"An error occurred while fetching user: {str(e)}"}
+        return {"valid": False, "status_message": f"User validation failed: {str(e)}"}
 
 
 @mcp.tool()
 async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> dict:
     """
     Validate if a D2L Org Unit / Module is valid strictly against the Code column.
-    Returns valid = True ONLY if an exact Code match is found, IsActive is True,
-    and IsDeleted is False. Otherwise returns valid = False.
+    Returns strictly the validation status result without further module details.
     """
     domain = domain or os.environ.get("D2L_DOMAIN", "sptest.brightspace.com")
     clean_code = module_code.strip()
@@ -206,7 +151,6 @@ async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> di
         
         target_id = None
         
-        # 1. Search strictly by exactOrgUnitCode
         async with httpx.AsyncClient(timeout=10.0) as client:
             res = await client.get(search_url, headers=headers, params={"exactOrgUnitCode": clean_code})
             if res.status_code == 200:
@@ -216,15 +160,12 @@ async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> di
                         target_id = item.get("Identifier")
                         break
 
-        # 2. Return INVALID if Code was not found
         if not target_id:
             return {
                 "valid": False,
-                "code": clean_code,
-                "status_message": f"Module code '{clean_code}' is INVALID (Code not found)."
+                "status_message": f"Module code '{clean_code}' is INVALID."
             }
 
-        # 3. Evaluate IsActive and IsDeleted status
         async with httpx.AsyncClient(timeout=10.0) as client:
             detail_url = f"https://{domain}/d2l/api/lp/1.46/courses/{target_id}"
             res = await client.get(detail_url, headers=headers)
@@ -242,28 +183,16 @@ async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> di
         if is_valid:
             return {
                 "valid": True,
-                "code": org_unit.get("Code", clean_code),
-                "name": org_unit.get("Name"),
-                "status_message": f"Module code '{org_unit.get('Code', clean_code)}' is VALID."
+                "status_message": f"Module code '{clean_code}' is VALID."
             }
-        
-        reasons = []
-        if not is_active:
-            reasons.append("IsActive=False")
-        if is_deleted:
-            reasons.append("IsDeleted=True")
 
         return {
             "valid": False,
-            "code": org_unit.get("Code", clean_code),
-            "name": org_unit.get("Name"),
-            "status_message": f"Module code '{org_unit.get('Code', clean_code)}' is INVALID ({', '.join(reasons)})."
+            "status_message": f"Module code '{clean_code}' is INVALID."
         }
 
-    except httpx.HTTPStatusError as e:
-        return {"valid": False, "error": f"D2L API returned HTTP {e.response.status_code}: {e.response.text}"}
     except Exception as e:
-        return {"valid": False, "error": f"An error occurred while validating module code: {str(e)}"}
+        return {"valid": False, "status_message": f"Module code validation failed: {str(e)}"}
 
 
 if __name__ == "__main__":
