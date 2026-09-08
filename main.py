@@ -59,20 +59,97 @@ async def get_valid_access_token() -> str:
 @mcp.tool()
 async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
     """
-    Fetch user details (including IsActive status) directly via D2L Brightspace LP API version 1.46.
+    Fetch user details (including IsActive status) via D2L Brightspace LP API version 1.46.
+    Checks exact match first (by UserName or Email). If no exact match exists, searches for candidates
+    and returns them to prompt the user for confirmation.
     """
     domain = domain or os.environ.get("D2L_DOMAIN", "sp.brightspace.com")
+    clean_user = username.strip()
+
+    if not clean_user:
+        return {"error": "Username parameter cannot be empty."}
 
     try:
         bearer_token = await get_valid_access_token()
-        url = f"https://{domain}/d2l/api/lp/1.46/users/"
         headers = {"Authorization": f"Bearer {bearer_token}"}
-        params = {"userName": username} if username else {}
+        url = f"https://{domain}/d2l/api/lp/1.46/users/"
         
+        # 1. Query D2L users endpoint
+        items = []
         async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, params=params)
-            response.raise_for_status()
-            return response.json()
+            response = await client.get(url, headers=headers, params={"userName": clean_user})
+            if response.status_code == 200:
+                raw_data = response.json()
+                items = raw_data.get("Items", raw_data) if isinstance(raw_data, dict) else raw_data
+                if not isinstance(items, list):
+                    items = []
+
+            # Step 1B: Fallback search if userName parameter returned 0 results
+            if not items:
+                response = await client.get(url, headers=headers, params={"query": clean_user})
+                if response.status_code == 200:
+                    raw_data = response.json()
+                    items = raw_data.get("Items", raw_data) if isinstance(raw_data, dict) else raw_data
+                    if not isinstance(items, list):
+                        items = []
+
+        # 2. Look for an Exact Match on UserName or EmailAddress
+        exact_user = None
+        target = clean_user.lower()
+        for u in items:
+            u_name = str(u.get("UserName", "")).strip().lower()
+            u_email = str(u.get("EmailAddress", "")).strip().lower()
+            if u_name == target or u_email == target:
+                exact_user = u
+                break
+
+        # 3. Exact Match Found: Return detailed user status
+        if exact_user:
+            activation = exact_user.get("Activation", {})
+            is_active = activation.get("IsActive", False) if isinstance(activation, dict) else False
+            
+            return {
+                "found": True,
+                "exact_match_found": True,
+                "user_id": exact_user.get("UserId"),
+                "username": exact_user.get("UserName"),
+                "first_name": exact_user.get("FirstName"),
+                "last_name": exact_user.get("LastName"),
+                "email": exact_user.get("EmailAddress"),
+                "org_defined_id": exact_user.get("OrgDefinedId"),
+                "is_active": is_active,
+                "status_message": (
+                    f"User '{exact_user.get('UserName')}' is ACTIVE."
+                    if is_active
+                    else f"User '{exact_user.get('UserName')}' is INACTIVE."
+                )
+            }
+
+        # 4. No Exact Match: Format up to 5 candidate options for user selection
+        candidates = []
+        for u in items[:5]:
+            candidates.append({
+                "user_id": u.get("UserId"),
+                "username": u.get("UserName"),
+                "name": f"{u.get('FirstName', '')} {u.get('LastName', '')}".strip(),
+                "email": u.get("EmailAddress")
+            })
+
+        if candidates:
+            return {
+                "found": False,
+                "exact_match_found": False,
+                "status_message": f"Exact user/email '{clean_user}' was not found. Please select from the candidate list below.",
+                "candidate_users": candidates,
+                "instruction": "Present these candidate user options (Username, Name, Email) to the user and ask them to confirm which one they meant."
+            }
+
+        return {
+            "found": False,
+            "exact_match_found": False,
+            "reason": f"No user matching '{clean_user}' was found in Brightspace."
+        }
+
     except httpx.HTTPStatusError as e:
         return {"error": f"D2L User API returned HTTP {e.response.status_code}: {e.response.text}"}
     except Exception as e:
