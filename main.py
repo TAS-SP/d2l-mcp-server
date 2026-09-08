@@ -7,51 +7,65 @@ from fastmcp import FastMCP
 # Initialize FastMCP Server
 mcp = FastMCP("D2L-v146-Server")
 
-# In-memory token cache for stateless client_credentials grant
+# In-memory token cache to support token lifetime and rotation across requests
 TOKEN_CACHE = {
     "access_token": None,
-    "expires_at": 0
+    "expires_at": 0,
+    "current_refresh_token": None
 }
 
 async def get_valid_access_token() -> str:
     """
-    Retrieves an Access Token using static client_credentials grant.
-    Handles token expiration, cache resets, and timeouts without needing persistent refresh tokens.
+    Retrieve active Bearer token using memory cache or executing single-use refresh token exchange.
+    Handles D2L's automatic token rotation logic seamlessly.
     """
     now = time.time()
     
-    # Return cached token if valid (with 60s buffer)
+    # 1. Reuse existing access token if valid (with 60s safety buffer)
     if TOKEN_CACHE["access_token"] and TOKEN_CACHE["expires_at"] > now + 60:
         return TOKEN_CACHE["access_token"]
 
     client_id = os.environ.get("D2L_CLIENT_ID")
     client_secret = os.environ.get("D2L_CLIENT_SECRET")
-    scope = os.environ.get("D2L_SCOPE", "core:*:*")
+    refresh_token = (TOKEN_CACHE["current_refresh_token"] or os.environ.get("D2L_REFRESH_TOKEN", "")).strip()
 
-    if not all([client_id, client_secret]):
-        raise ValueError("Missing D2L_CLIENT_ID or D2L_CLIENT_SECRET environment variables.")
+    if not all([client_id, client_secret, refresh_token]):
+        raise ValueError("Missing D2L_CLIENT_ID, D2L_CLIENT_SECRET, or D2L_REFRESH_TOKEN environment variables.")
+
+    if refresh_token.startswith("eyJ"):
+        print("LOG ERROR: D2L_REFRESH_TOKEN starts with 'eyJ'. It is an Access Token (JWT), not a Refresh Token.")
+        raise ValueError("D2L_REFRESH_TOKEN is set to a JWT Access Token instead of an opaque Refresh Token.")
 
     token_url = "https://auth.brightspace.com/core/connect/token"
     payload = {
-        "grant_type": "client_credentials",
+        "grant_type": "refresh_token",
         "client_id": client_id,
         "client_secret": client_secret,
-        "scope": scope
+        "refresh_token": refresh_token
     }
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             response = await client.post(token_url, data=payload)
+            
+            # Print exact D2L auth payload if the request fails
+            if response.status_code != 200:
+                print(f"D2L Auth Error Response ({response.status_code}): {response.text}")
+                
             response.raise_for_status()
             data = response.json()
 
+            # Cache the new access token
             TOKEN_CACHE["access_token"] = data["access_token"]
             TOKEN_CACHE["expires_at"] = now + data.get("expires_in", 1800)
+            
+            # Save newly rotated refresh token if returned by D2L
+            if "refresh_token" in data:
+                TOKEN_CACHE["current_refresh_token"] = data["refresh_token"]
 
             return TOKEN_CACHE["access_token"]
 
         except (httpx.TimeoutException, httpx.HTTPStatusError, Exception) as e:
-            # Clear cache on error so the next attempt tries a fresh auth fetch
             TOKEN_CACHE["access_token"] = None
             TOKEN_CACHE["expires_at"] = 0
             raise RuntimeError(f"Failed to retrieve access token from D2L: {str(e)}")
@@ -93,7 +107,7 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                     if not isinstance(items, list):
                         items = []
 
-        # 1. Exact Match Check
+        # 1. Look for an Exact Match on UserName or EmailAddress
         exact_user = None
         target = clean_user.lower()
         for u in items:
@@ -103,6 +117,7 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                 exact_user = u
                 break
 
+        # 2. Exact Match Found: Return detailed user status
         if exact_user:
             activation = exact_user.get("Activation", {})
             is_active = activation.get("IsActive", False) if isinstance(activation, dict) else False
@@ -123,7 +138,7 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                 )
             }
 
-        # 2. Similar Match Fallback (Minimum 45% similarity threshold)
+        # 3. Similar Match Fallback (Minimum 45% similarity threshold)
         best_candidate = None
         highest_score = 0.0
 
