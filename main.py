@@ -89,7 +89,8 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
 async def validate_d2l_module_146(org_unit_identifier: str, domain: str = "") -> dict:
     """
     Validate if a D2L Org Unit / Module is valid (IsActive is true AND IsDeleted is false).
-    Searches against the Code column (exact match first, then partial match fallback), or by numeric OrgUnit ID.
+    Searches against the Code column (exact match first, then partial match fallback) or by numeric OrgUnit ID,
+    then fetches full record details to accurately capture IsActive status.
     """
     domain = domain or os.environ.get("D2L_DOMAIN", "sp.brightspace.com")
 
@@ -97,45 +98,46 @@ async def validate_d2l_module_146(org_unit_identifier: str, domain: str = "") ->
         bearer_token = await get_valid_access_token()
         headers = {"Authorization": f"Bearer {bearer_token}"}
         
-        org_unit = None
+        target_id = None
         
-        # 1. If input is strictly numeric, check directly by OrgUnit ID first
+        # 1. If input is strictly numeric, use directly as OrgUnit ID
         if org_unit_identifier.isdigit():
-            url = f"https://{domain}/d2l/api/lp/1.46/orgstructure/{org_unit_identifier}"
-            async with httpx.AsyncClient() as client:
-                res = await client.get(url, headers=headers)
-                if res.status_code == 200:
-                    org_unit = res.json()
-
-        # 2. Search against the Code column
-        if not org_unit:
+            target_id = org_unit_identifier
+        else:
+            # 2. Search against the Code column to extract the target OrgUnit Identifier
             search_url = f"https://{domain}/d2l/api/lp/1.46/orgstructure/"
             
-            # Step 2A: Exact match on Code column
+            # Step 2A: Exact match on Code
             async with httpx.AsyncClient() as client:
                 res = await client.get(search_url, headers=headers, params={"exactOrgUnitCode": org_unit_identifier})
-                if res.status_code == 200:
-                    data = res.json()
-                    items = data.get("Items", [])
-                    if items:
-                        org_unit = items[0]
+                if res.status_code == 200 and res.json().get("Items"):
+                    target_id = res.json()["Items"][0].get("Identifier")
 
-            # Step 2B: Substring match fallback on Code column if exact match returned 0 results
-            if not org_unit:
+            # Step 2B: Substring match fallback on Code
+            if not target_id:
                 async with httpx.AsyncClient() as client:
                     res = await client.get(search_url, headers=headers, params={"orgUnitCode": org_unit_identifier})
-                    if res.status_code == 200:
-                        data = res.json()
-                        items = data.get("Items", [])
-                        if items:
-                            org_unit = items[0]
+                    if res.status_code == 200 and res.json().get("Items"):
+                        target_id = res.json()["Items"][0].get("Identifier")
 
-        # Handle case where no match was found for the Code or ID
-        if not org_unit or "Identifier" not in org_unit:
+        if not target_id:
             return {
                 "valid": False,
                 "reason": f"No Org Unit matching Code or ID '{org_unit_identifier}' was found in Brightspace."
             }
+
+        # 3. Fetch full details to get true IsActive and IsDeleted status
+        detail_url = f"https://{domain}/d2l/api/lp/1.46/courses/{target_id}"
+        async with httpx.AsyncClient() as client:
+            res = await client.get(detail_url, headers=headers)
+            
+            # Fall back to orgstructure detail if item is an org unit type other than a course offering
+            if res.status_code != 200:
+                detail_url = f"https://{domain}/d2l/api/lp/1.46/orgstructure/{target_id}"
+                res = await client.get(detail_url, headers=headers)
+
+            res.raise_for_status()
+            org_unit = res.json()
 
         is_active = org_unit.get("IsActive", False)
         is_deleted = org_unit.get("IsDeleted", False)
@@ -158,7 +160,7 @@ async def validate_d2l_module_146(org_unit_identifier: str, domain: str = "") ->
         }
         
     except httpx.HTTPStatusError as e:
-        return {"error": f"D2L OrgStructure API returned HTTP {e.response.status_code}: {e.response.text}"}
+        return {"error": f"D2L API returned HTTP {e.response.status_code}: {e.response.text}"}
     except Exception as e:
         return {"error": f"An error occurred while validating module: {str(e)}"}
 
