@@ -7,7 +7,7 @@ from fastmcp import FastMCP
 # Initialize FastMCP Server
 mcp = FastMCP("D2L-v146-Server")
 
-# In-memory token cache to support token lifetime and rotation across requests
+# In-memory token cache for Render environment runtime
 TOKEN_CACHE = {
     "access_token": None,
     "expires_at": 0,
@@ -17,7 +17,6 @@ TOKEN_CACHE = {
 async def get_valid_access_token() -> str:
     """
     Retrieve active Bearer token using memory cache or executing single-use refresh token exchange.
-    Handles D2L's automatic token rotation logic seamlessly.
     """
     now = time.time()
     
@@ -67,13 +66,20 @@ async def get_valid_access_token() -> str:
 
 
 @mcp.tool()
-async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
+async def get_d2l_users_146(
+    username: str = "",
+    user_id: str = "",
+    user_name: str = "",
+    domain: str = "",
+    **kwargs
+) -> dict:
     """
-    Validate if a user exists and is active in D2L.
-    If exact match fails, performs similarity search to suggest the closest username.
+    Validate if a user exists and is active in D2L strictly against UserName/Email.
+    Accepts aliases (username, user_id, user_name) to prevent agent parameter schema errors.
     """
     domain = domain or os.environ.get("D2L_DOMAIN", "sptest.brightspace.com")
-    clean_user = username.strip()
+    raw_user = username or user_name or user_id or str(kwargs.get("user", ""))
+    clean_user = raw_user.strip()
 
     if not clean_user:
         return {"valid": False, "status_message": "Username parameter cannot be empty."}
@@ -92,7 +98,6 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                 if not isinstance(items, list):
                     items = []
 
-            # Fallback search query if exact username parameter returned nothing
             if not items:
                 response = await client.get(url, headers=headers, params={"query": clean_user})
                 if response.status_code == 200:
@@ -126,7 +131,7 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                     "status_message": f"User '{clean_user}' is INACTIVE."
                 }
 
-        # 2. Similarity Search for Suggestions
+        # 2. Similarity Search for Username Suggestions
         best_candidate = None
         highest_score = 0.0
 
@@ -164,13 +169,20 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
 
 
 @mcp.tool()
-async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> dict:
+async def validate_d2l_module_146(
+    module_code: str = "",
+    org_unit_identifier: str = "",
+    org_unit_code: str = "",
+    domain: str = "",
+    **kwargs
+) -> dict:
     """
-    Validate if a D2L Org Unit / Module is valid.
-    If exact match fails, performs similarity search across org structures to suggest the closest module code.
+    Validate a D2L Org Unit / Module STRICTLY against the Code column.
+    Ignores numeric IDs or other attributes for matching. Returns similarity suggestions matching the Code column if failed.
     """
     domain = domain or os.environ.get("D2L_DOMAIN", "sptest.brightspace.com")
-    clean_code = module_code.strip()
+    raw_code = module_code or org_unit_identifier or org_unit_code or str(kwargs.get("code", ""))
+    clean_code = raw_code.strip()
 
     if not clean_code:
         return {"valid": False, "status_message": "Module code parameter cannot be empty."}
@@ -184,22 +196,22 @@ async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> di
         items = []
         
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # 1. Exact match attempt
+            # 1. Exact match strictly by the Code column
             res = await client.get(search_url, headers=headers, params={"exactOrgUnitCode": clean_code})
             if res.status_code == 200:
                 items = res.json().get("Items", [])
                 for item in items:
-                    if item.get("Code", "").strip().lower() == clean_code.lower():
+                    if str(item.get("Code", "")).strip().lower() == clean_code.lower():
                         target_id = item.get("Identifier")
                         break
 
-            # 2. Broad search fallback for candidate gathering if exact match failed
+            # 2. Candidate collection for similarity search if exact Code match failed
             if not target_id:
                 res_broad = await client.get(search_url, headers=headers, params={"orgUnitCode": clean_code})
                 if res_broad.status_code == 200:
                     items = res_broad.json().get("Items", [])
 
-        # Validate exact match if found
+        # Validate exact match if Code column yielded an Identifier
         if target_id:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 detail_url = f"https://{domain}/d2l/api/lp/1.46/courses/{target_id}"
@@ -208,25 +220,24 @@ async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> di
                     detail_url = f"https://{domain}/d2l/api/lp/1.46/orgstructure/{target_id}"
                     res = await client.get(detail_url, headers=headers)
 
-                res.raise_for_status()
-                org_unit = res.json()
+                if res.status_code == 200:
+                    org_unit = res.json()
+                    is_active = org_unit.get("IsActive", False)
+                    is_deleted = org_unit.get("IsDeleted", False)
+                    is_valid = (is_active is True) and (is_deleted is False)
 
-            is_active = org_unit.get("IsActive", False)
-            is_deleted = org_unit.get("IsDeleted", False)
-            is_valid = (is_active is True) and (is_deleted is False)
+                    if is_valid:
+                        return {
+                            "valid": True,
+                            "status_message": f"Module code '{clean_code}' is VALID."
+                        }
+                    else:
+                        return {
+                            "valid": False,
+                            "status_message": f"Module code '{clean_code}' is INACTIVE or DELETED."
+                        }
 
-            if is_valid:
-                return {
-                    "valid": True,
-                    "status_message": f"Module code '{clean_code}' is VALID."
-                }
-            else:
-                return {
-                    "valid": False,
-                    "status_message": f"Module code '{clean_code}' is INACTIVE or DELETED."
-                }
-
-        # 3. Similarity Search for Module Code Suggestions
+        # 3. Similarity Search strictly evaluating candidate Code values
         best_candidate_code = None
         highest_score = 0.0
         target_code = clean_code.lower()
