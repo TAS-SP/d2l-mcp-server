@@ -133,12 +133,10 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
             u_name = str(u.get("UserName", "")).strip().lower()
             u_email = str(u.get("EmailAddress", "")).strip().lower()
 
-            # Calculate string similarity ratio against target
             score_name = difflib.SequenceMatcher(None, target, u_name).ratio()
             score_email = difflib.SequenceMatcher(None, target, u_email).ratio()
             max_score = max(score_name, score_email)
 
-            # Boost score if target is a substring or prefix match
             if target in u_name or target in u_email or u_name.startswith(target):
                 max_score = max(max_score, 0.7)
 
@@ -146,7 +144,6 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                 highest_score = max_score
                 best_candidate = u
 
-        # Only suggest candidate if similarity score is at least 45%
         if best_candidate and highest_score >= 0.45:
             display_name = f"{best_candidate.get('FirstName', '')} {best_candidate.get('LastName', '')}".strip()
             matched_username = best_candidate.get("UserName")
@@ -177,118 +174,105 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
 
 
 @mcp.tool()
-async def validate_d2l_module_146(org_unit_identifier: str, domain: str = "") -> dict:
+async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> dict:
     """
-    Validate if a D2L Org Unit / Module is valid (IsActive is true AND IsDeleted is false).
-    Checks exact match first. If no exact match exists, searches for candidate modules matching the code or base prefix
-    and asks the user to confirm.
+    Validate if a D2L Org Unit / Module is valid strictly against the Code column.
+    Returns valid = True ONLY if an exact Code match is found, IsActive is True,
+    IsDeleted is False, and Org Unit Type is 'Course Offering'.
+    Otherwise returns valid = False.
     """
     domain = domain or os.environ.get("D2L_DOMAIN", "sp.brightspace.com")
-    clean_code = org_unit_identifier.strip()
+    clean_code = module_code.strip()
+
+    if not clean_code:
+        return {"valid": False, "status_message": "Module code parameter cannot be empty."}
 
     try:
         bearer_token = await get_valid_access_token()
         headers = {"Authorization": f"Bearer {bearer_token}"}
-        
-        target_id = None
         search_url = f"https://{domain}/d2l/api/lp/1.46/orgstructure/"
         
-        # 1. Direct ID lookup if input is strictly numeric
-        if clean_code.isdigit():
-            target_id = clean_code
-        else:
-            # 2. Check for Exact Match on Code column
-            async with httpx.AsyncClient() as client:
-                res = await client.get(search_url, headers=headers, params={"exactOrgUnitCode": clean_code})
-                if res.status_code == 200:
-                    items = res.json().get("Items", [])
-                    for item in items:
-                        if item.get("Code", "").strip().lower() == clean_code.lower():
-                            target_id = item.get("Identifier")
-                            break
-
-        # 3. Exact Match Found: Fetch full course details and return validation status
-        if target_id:
-            detail_url = f"https://{domain}/d2l/api/lp/1.46/courses/{target_id}"
-            async with httpx.AsyncClient() as client:
-                res = await client.get(detail_url, headers=headers)
-                if res.status_code != 200:
-                    detail_url = f"https://{domain}/d2l/api/lp/1.46/orgstructure/{target_id}"
-                    res = await client.get(detail_url, headers=headers)
-
-                res.raise_for_status()
-                org_unit = res.json()
-
-            is_active = org_unit.get("IsActive", False)
-            is_deleted = org_unit.get("IsDeleted", False)
-            is_valid = (is_active is True) and (is_deleted is False)
-
-            return {
-                "valid": is_valid,
-                "exact_match_found": True,
-                "name": org_unit.get("Name"),
-                "code": org_unit.get("Code"),
-                "is_active": is_active,
-                "is_deleted": is_deleted,
-                "status_message": (
-                    f"Module '{org_unit.get('Code')}' is valid (IsActive=True, IsDeleted=False)."
-                    if is_valid
-                    else f"Module '{org_unit.get('Code')}' is INVALID (IsActive={is_active}, IsDeleted={is_deleted})."
-                )
-            }
-
-        # 4. No Exact Match: Perform fallback candidate search
-        candidates_raw = []
+        target_id = None
+        
+        # 1. Search strictly by exactOrgUnitCode
         async with httpx.AsyncClient() as client:
-            res = await client.get(search_url, headers=headers, params={"orgUnitCode": clean_code})
+            res = await client.get(search_url, headers=headers, params={"exactOrgUnitCode": clean_code})
             if res.status_code == 200:
-                candidates_raw = res.json().get("Items", [])
+                items = res.json().get("Items", [])
+                for item in items:
+                    if item.get("Code", "").strip().lower() == clean_code.lower():
+                        target_id = item.get("Identifier")
+                        break
 
-            if not candidates_raw and ("-" in clean_code or "_" in clean_code):
-                base_prefix = clean_code.replace("_", "-").split("-")[0].strip()
-                res = await client.get(search_url, headers=headers, params={"orgUnitCode": base_prefix})
-                if res.status_code == 200:
-                    candidates_raw = res.json().get("Items", [])
-
-            if not candidates_raw:
-                res = await client.get(search_url, headers=headers, params={"search": clean_code})
-                if res.status_code == 200:
-                    candidates_raw = res.json().get("Items", [])
-
-        # Filter candidate list to unique module codes and names without internal IDs
-        candidate_modules = []
-        seen_codes = set()
-        for item in candidates_raw:
-            c_code = item.get("Code", "").strip()
-            c_name = item.get("Name", "").strip()
-            if c_code and c_code.lower() not in seen_codes:
-                seen_codes.add(c_code.lower())
-                candidate_modules.append({
-                    "code": c_code,
-                    "name": c_name
-                })
-            if len(candidate_modules) >= 5:
-                break
-
-        if candidate_modules:
+        # 2. If no exact match on Code exists, return INVALID
+        if not target_id:
             return {
                 "valid": False,
-                "exact_match_found": False,
-                "status_message": f"Exact module code '{clean_code}' was not found in Brightspace.",
-                "candidate_modules": candidate_modules,
-                "instruction": f"Exact match for '{clean_code}' was not found. Ask the user if they meant one of these module codes: {', '.join([c['code'] for c in candidate_modules])}."
+                "code": clean_code,
+                "status_message": f"Module code '{clean_code}' is INVALID (Code not found)."
             }
+
+        # 3. Fetch module details to evaluate IsActive, IsDeleted, and Type
+        async with httpx.AsyncClient() as client:
+            detail_url = f"https://{domain}/d2l/api/lp/1.46/courses/{target_id}"
+            res = await client.get(detail_url, headers=headers)
+            if res.status_code != 200:
+                detail_url = f"https://{domain}/d2l/api/lp/1.46/orgstructure/{target_id}"
+                res = await client.get(detail_url, headers=headers)
+
+            res.raise_for_status()
+            org_unit = res.json()
+
+        is_active = org_unit.get("IsActive", False)
+        is_deleted = org_unit.get("IsDeleted", False)
+
+        # 4. Check Org Unit Type (must be 'Course Offering')
+        org_type = org_unit.get("Type", {})
+        if isinstance(org_type, dict):
+            type_name = str(org_type.get("Name", "")).strip().lower()
+            type_code = str(org_type.get("Code", "")).strip().lower()
+            is_course_offering = (type_name == "course offering" or type_code == "course offering")
+        elif isinstance(org_type, str):
+            is_course_offering = (org_type.strip().lower() == "course offering")
+        else:
+            is_course_offering = False
+
+        is_valid = (is_active is True) and (is_deleted is False) and is_course_offering
+
+        actual_type_str = (
+            org_type.get("Name") if isinstance(org_type, dict) else str(org_type)
+        ) or "Unknown"
+
+        if is_valid:
+            return {
+                "valid": True,
+                "code": org_unit.get("Code", clean_code),
+                "name": org_unit.get("Name"),
+                "type": actual_type_str,
+                "status_message": f"Module code '{org_unit.get('Code', clean_code)}' is VALID (Course Offering, Active, Not Deleted)."
+            }
+        
+        # Build specific explanation for invalid status
+        reasons = []
+        if not is_course_offering:
+            reasons.append(f"Type='{actual_type_str}' (must be 'Course Offering')")
+        if not is_active:
+            reasons.append("IsActive=False")
+        if is_deleted:
+            reasons.append("IsDeleted=True")
 
         return {
             "valid": False,
-            "exact_match_found": False,
-            "reason": f"No Org Unit matching Code or ID '{clean_code}' was found in Brightspace."
+            "code": org_unit.get("Code", clean_code),
+            "name": org_unit.get("Name"),
+            "type": actual_type_str,
+            "status_message": f"Module code '{org_unit.get('Code', clean_code)}' is INVALID ({', '.join(reasons)})."
         }
-        
+
     except httpx.HTTPStatusError as e:
-        return {"error": f"D2L API returned HTTP {e.response.status_code}: {e.response.text}"}
+        return {"valid": False, "error": f"D2L API returned HTTP {e.response.status_code}: {e.response.text}"}
     except Exception as e:
-        return {"error": f"An error occurred while validating module: {str(e)}"}
+        return {"valid": False, "error": f"An error occurred while validating module code: {str(e)}"}
 
 
 if __name__ == "__main__":
