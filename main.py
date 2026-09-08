@@ -7,54 +7,54 @@ from fastmcp import FastMCP
 # Initialize FastMCP Server
 mcp = FastMCP("D2L-v146-Server")
 
-# In-memory token cache to support single-use D2L token rotation across requests
+# In-memory token cache for stateless client_credentials grant
 TOKEN_CACHE = {
     "access_token": None,
-    "expires_at": 0,
-    "current_refresh_token": None
+    "expires_at": 0
 }
 
 async def get_valid_access_token() -> str:
     """
-    Retrieve active Bearer token using memory cache or executing single-use refresh token exchange.
-    Handles D2L's automatic token rotation logic seamlessly.
+    Retrieves an Access Token using static client_credentials grant.
+    Handles token expiration, cache resets, and timeouts without needing persistent refresh tokens.
     """
     now = time.time()
     
+    # Return cached token if valid (with 60s buffer)
     if TOKEN_CACHE["access_token"] and TOKEN_CACHE["expires_at"] > now + 60:
         return TOKEN_CACHE["access_token"]
 
     client_id = os.environ.get("D2L_CLIENT_ID")
     client_secret = os.environ.get("D2L_CLIENT_SECRET")
-    refresh_token = (TOKEN_CACHE["current_refresh_token"] or os.environ.get("D2L_REFRESH_TOKEN", "")).strip()
+    scope = os.environ.get("D2L_SCOPE", "core:*:*")
 
-    if not all([client_id, client_secret, refresh_token]):
-        raise ValueError("Missing D2L_CLIENT_ID, D2L_CLIENT_SECRET, or D2L_REFRESH_TOKEN environment variables.")
-
-    if refresh_token.startswith("eyJ"):
-        print("LOG ERROR: D2L_REFRESH_TOKEN starts with 'eyJ'. It is an Access Token (JWT), not a Refresh Token.")
-        raise ValueError("D2L_REFRESH_TOKEN is set to a JWT Access Token instead of an opaque Refresh Token.")
+    if not all([client_id, client_secret]):
+        raise ValueError("Missing D2L_CLIENT_ID or D2L_CLIENT_SECRET environment variables.")
 
     token_url = "https://auth.brightspace.com/core/connect/token"
     payload = {
-        "grant_type": "refresh_token",
+        "grant_type": "client_credentials",
         "client_id": client_id,
         "client_secret": client_secret,
-        "refresh_token": refresh_token
+        "scope": scope
     }
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(token_url, data=payload)
-        response.raise_for_status()
-        data = response.json()
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            response = await client.post(token_url, data=payload)
+            response.raise_for_status()
+            data = response.json()
 
-        TOKEN_CACHE["access_token"] = data["access_token"]
-        TOKEN_CACHE["expires_at"] = now + data.get("expires_in", 7200)
-        
-        if "refresh_token" in data:
-            TOKEN_CACHE["current_refresh_token"] = data["refresh_token"]
+            TOKEN_CACHE["access_token"] = data["access_token"]
+            TOKEN_CACHE["expires_at"] = now + data.get("expires_in", 1800)
 
-        return TOKEN_CACHE["access_token"]
+            return TOKEN_CACHE["access_token"]
+
+        except (httpx.TimeoutException, httpx.HTTPStatusError, Exception) as e:
+            # Clear cache on error so the next attempt tries a fresh auth fetch
+            TOKEN_CACHE["access_token"] = None
+            TOKEN_CACHE["expires_at"] = 0
+            raise RuntimeError(f"Failed to retrieve access token from D2L: {str(e)}")
 
 
 @mcp.tool()
@@ -75,9 +75,8 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
         headers = {"Authorization": f"Bearer {bearer_token}"}
         url = f"https://{domain}/d2l/api/lp/1.46/users/"
         
-        # 1. Query D2L users endpoint
         items = []
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(url, headers=headers, params={"userName": clean_user})
             if response.status_code == 200:
                 raw_data = response.json()
@@ -85,7 +84,7 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                 if not isinstance(items, list):
                     items = []
 
-            # Step 1B: Fallback search if userName parameter returned 0 results
+            # Fallback search if userName parameter returned 0 results
             if not items:
                 response = await client.get(url, headers=headers, params={"query": clean_user})
                 if response.status_code == 200:
@@ -94,7 +93,7 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                     if not isinstance(items, list):
                         items = []
 
-        # 2. Look for an Exact Match on UserName or EmailAddress
+        # 1. Exact Match Check
         exact_user = None
         target = clean_user.lower()
         for u in items:
@@ -104,7 +103,6 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                 exact_user = u
                 break
 
-        # 3. Exact Match Found: Return detailed user status
         if exact_user:
             activation = exact_user.get("Activation", {})
             is_active = activation.get("IsActive", False) if isinstance(activation, dict) else False
@@ -125,7 +123,7 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                 )
             }
 
-        # 4. No Exact Match: Filter candidates by similarity threshold
+        # 2. Similar Match Fallback (Minimum 45% similarity threshold)
         best_candidate = None
         highest_score = 0.0
 
@@ -194,7 +192,7 @@ async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> di
         target_id = None
         
         # 1. Search strictly by exactOrgUnitCode
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             res = await client.get(search_url, headers=headers, params={"exactOrgUnitCode": clean_code})
             if res.status_code == 200:
                 items = res.json().get("Items", [])
@@ -203,7 +201,7 @@ async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> di
                         target_id = item.get("Identifier")
                         break
 
-        # 2. If no exact match on Code exists, return INVALID
+        # 2. Return INVALID if Code was not found
         if not target_id:
             return {
                 "valid": False,
@@ -211,8 +209,8 @@ async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> di
                 "status_message": f"Module code '{clean_code}' is INVALID (Code not found)."
             }
 
-        # 3. Fetch module details to evaluate IsActive and IsDeleted
-        async with httpx.AsyncClient() as client:
+        # 3. Evaluate IsActive and IsDeleted status
+        async with httpx.AsyncClient(timeout=10.0) as client:
             detail_url = f"https://{domain}/d2l/api/lp/1.46/courses/{target_id}"
             res = await client.get(detail_url, headers=headers)
             if res.status_code != 200:
@@ -234,7 +232,6 @@ async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> di
                 "status_message": f"Module code '{org_unit.get('Code', clean_code)}' is VALID."
             }
         
-        # Build specific explanation for invalid status
         reasons = []
         if not is_active:
             reasons.append("IsActive=False")
