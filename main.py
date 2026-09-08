@@ -1,6 +1,7 @@
 import os
 import time
 import httpx
+import difflib
 from fastmcp import FastMCP
 
 # Initialize FastMCP Server
@@ -68,8 +69,8 @@ async def get_valid_access_token() -> str:
 @mcp.tool()
 async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
     """
-    Validate if a user exists and is active in D2L Brightspace LP API version 1.46.
-    Returns strictly the validation status result without sensitive user metadata.
+    Validate if a user exists and is active in D2L.
+    If exact match fails, performs similarity search to suggest the closest username.
     """
     domain = domain or os.environ.get("D2L_DOMAIN", "sptest.brightspace.com")
     clean_user = username.strip()
@@ -91,6 +92,7 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                 if not isinstance(items, list):
                     items = []
 
+            # Fallback search query if exact username parameter returned nothing
             if not items:
                 response = await client.get(url, headers=headers, params={"query": clean_user})
                 if response.status_code == 200:
@@ -99,6 +101,7 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                     if not isinstance(items, list):
                         items = []
 
+        # 1. Exact Match Check
         exact_user = None
         target = clean_user.lower()
         for u in items:
@@ -123,6 +126,34 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                     "status_message": f"User '{clean_user}' is INACTIVE."
                 }
 
+        # 2. Similarity Search for Suggestions
+        best_candidate = None
+        highest_score = 0.0
+
+        for u in items:
+            u_name = str(u.get("UserName", "")).strip().lower()
+            u_email = str(u.get("EmailAddress", "")).strip().lower()
+
+            score_name = difflib.SequenceMatcher(None, target, u_name).ratio()
+            score_email = difflib.SequenceMatcher(None, target, u_email).ratio()
+            max_score = max(score_name, score_email)
+
+            if target in u_name or target in u_email or u_name.startswith(target):
+                max_score = max(max_score, 0.7)
+
+            if max_score > highest_score:
+                highest_score = max_score
+                best_candidate = u
+
+        if best_candidate and highest_score >= 0.45:
+            matched_username = best_candidate.get("UserName")
+            return {
+                "valid": False,
+                "status_message": f"Exact match for '{clean_user}' not found.",
+                "similar_match": matched_username,
+                "instruction": f"Ask the user: 'Exact match for {clean_user} not found. Did you mean {matched_username}?'"
+            }
+
         return {
             "valid": False,
             "status_message": f"User '{clean_user}' is INVALID."
@@ -135,8 +166,8 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
 @mcp.tool()
 async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> dict:
     """
-    Validate if a D2L Org Unit / Module is valid strictly against the Code column.
-    Returns strictly the validation status result without further module details.
+    Validate if a D2L Org Unit / Module is valid.
+    If exact match fails, performs similarity search across org structures to suggest the closest module code.
     """
     domain = domain or os.environ.get("D2L_DOMAIN", "sptest.brightspace.com")
     clean_code = module_code.strip()
@@ -150,8 +181,10 @@ async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> di
         search_url = f"https://{domain}/d2l/api/lp/1.46/orgstructure/"
         
         target_id = None
+        items = []
         
         async with httpx.AsyncClient(timeout=10.0) as client:
+            # 1. Exact match attempt
             res = await client.get(search_url, headers=headers, params={"exactOrgUnitCode": clean_code})
             if res.status_code == 200:
                 items = res.json().get("Items", [])
@@ -160,30 +193,63 @@ async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> di
                         target_id = item.get("Identifier")
                         break
 
-        if not target_id:
+            # 2. Broad search fallback for candidate gathering if exact match failed
+            if not target_id:
+                res_broad = await client.get(search_url, headers=headers, params={"orgUnitCode": clean_code})
+                if res_broad.status_code == 200:
+                    items = res_broad.json().get("Items", [])
+
+        # Validate exact match if found
+        if target_id:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                detail_url = f"https://{domain}/d2l/api/lp/1.46/courses/{target_id}"
+                res = await client.get(detail_url, headers=headers)
+                if res.status_code != 200:
+                    detail_url = f"https://{domain}/d2l/api/lp/1.46/orgstructure/{target_id}"
+                    res = await client.get(detail_url, headers=headers)
+
+                res.raise_for_status()
+                org_unit = res.json()
+
+            is_active = org_unit.get("IsActive", False)
+            is_deleted = org_unit.get("IsDeleted", False)
+            is_valid = (is_active is True) and (is_deleted is False)
+
+            if is_valid:
+                return {
+                    "valid": True,
+                    "status_message": f"Module code '{clean_code}' is VALID."
+                }
+            else:
+                return {
+                    "valid": False,
+                    "status_message": f"Module code '{clean_code}' is INACTIVE or DELETED."
+                }
+
+        # 3. Similarity Search for Module Code Suggestions
+        best_candidate_code = None
+        highest_score = 0.0
+        target_code = clean_code.lower()
+
+        for item in items:
+            item_code = str(item.get("Code", "")).strip().lower()
+            if not item_code:
+                continue
+
+            score = difflib.SequenceMatcher(None, target_code, item_code).ratio()
+            if target_code in item_code or item_code.startswith(target_code):
+                score = max(score, 0.7)
+
+            if score > highest_score:
+                highest_score = score
+                best_candidate_code = item.get("Code")
+
+        if best_candidate_code and highest_score >= 0.45:
             return {
                 "valid": False,
-                "status_message": f"Module code '{clean_code}' is INVALID."
-            }
-
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            detail_url = f"https://{domain}/d2l/api/lp/1.46/courses/{target_id}"
-            res = await client.get(detail_url, headers=headers)
-            if res.status_code != 200:
-                detail_url = f"https://{domain}/d2l/api/lp/1.46/orgstructure/{target_id}"
-                res = await client.get(detail_url, headers=headers)
-
-            res.raise_for_status()
-            org_unit = res.json()
-
-        is_active = org_unit.get("IsActive", False)
-        is_deleted = org_unit.get("IsDeleted", False)
-        is_valid = (is_active is True) and (is_deleted is False)
-
-        if is_valid:
-            return {
-                "valid": True,
-                "status_message": f"Module code '{clean_code}' is VALID."
+                "status_message": f"Exact match for module code '{clean_code}' not found.",
+                "similar_match": best_candidate_code,
+                "instruction": f"Ask the user: 'Module code {clean_code} was not found. Did you mean {best_candidate_code}?'"
             }
 
         return {
