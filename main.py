@@ -178,8 +178,7 @@ async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> di
     """
     Validate if a D2L Org Unit / Module is valid strictly against the Code column.
     Returns valid = True ONLY if an exact Code match is found, IsActive is True,
-    IsDeleted is False, and Org Unit Type is 'Course Offering'.
-    Otherwise returns valid = False.
+    and IsDeleted is False. Otherwise returns valid = False.
     """
     domain = domain or os.environ.get("D2L_DOMAIN", "sp.brightspace.com")
     clean_code = module_code.strip()
@@ -212,7 +211,7 @@ async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> di
                 "status_message": f"Module code '{clean_code}' is INVALID (Code not found)."
             }
 
-        # 3. Fetch module details to evaluate IsActive, IsDeleted, and Type
+        # 3. Fetch module details to evaluate IsActive and IsDeleted
         async with httpx.AsyncClient() as client:
             detail_url = f"https://{domain}/d2l/api/lp/1.46/courses/{target_id}"
             res = await client.get(detail_url, headers=headers)
@@ -225,37 +224,18 @@ async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> di
 
         is_active = org_unit.get("IsActive", False)
         is_deleted = org_unit.get("IsDeleted", False)
-
-        # 4. Check Org Unit Type (must be 'Course Offering')
-        org_type = org_unit.get("Type", {})
-        if isinstance(org_type, dict):
-            type_name = str(org_type.get("Name", "")).strip().lower()
-            type_code = str(org_type.get("Code", "")).strip().lower()
-            is_course_offering = (type_name == "course offering" or type_code == "course offering")
-        elif isinstance(org_type, str):
-            is_course_offering = (org_type.strip().lower() == "course offering")
-        else:
-            is_course_offering = False
-
-        is_valid = (is_active is True) and (is_deleted is False) and is_course_offering
-
-        actual_type_str = (
-            org_type.get("Name") if isinstance(org_type, dict) else str(org_type)
-        ) or "Unknown"
+        is_valid = (is_active is True) and (is_deleted is False)
 
         if is_valid:
             return {
                 "valid": True,
                 "code": org_unit.get("Code", clean_code),
                 "name": org_unit.get("Name"),
-                "type": actual_type_str,
-                "status_message": f"Module code '{org_unit.get('Code', clean_code)}' is VALID (Course Offering, Active, Not Deleted)."
+                "status_message": f"Module code '{org_unit.get('Code', clean_code)}' is VALID."
             }
         
         # Build specific explanation for invalid status
         reasons = []
-        if not is_course_offering:
-            reasons.append(f"Type='{actual_type_str}' (must be 'Course Offering')")
         if not is_active:
             reasons.append("IsActive=False")
         if is_deleted:
@@ -265,7 +245,6 @@ async def validate_d2l_module_146(module_code: str = "", domain: str = "") -> di
             "valid": False,
             "code": org_unit.get("Code", clean_code),
             "name": org_unit.get("Name"),
-            "type": actual_type_str,
             "status_message": f"Module code '{org_unit.get('Code', clean_code)}' is INVALID ({', '.join(reasons)})."
         }
 
