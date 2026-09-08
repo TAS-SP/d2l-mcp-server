@@ -60,8 +60,8 @@ async def get_valid_access_token() -> str:
 async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
     """
     Fetch user details (including IsActive status) via D2L Brightspace LP API version 1.46.
-    Checks exact match first (by UserName or Email). If no exact match exists, searches for candidates
-    and returns them to prompt the user for confirmation.
+    Checks exact match first (by UserName or Email). If no exact match exists, returns only a single 
+    top similar candidate to confirm identity without exposing internal User IDs or multiple matches.
     """
     domain = domain or os.environ.get("D2L_DOMAIN", "sp.brightspace.com")
     clean_user = username.strip()
@@ -111,7 +111,6 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
             return {
                 "found": True,
                 "exact_match_found": True,
-                "user_id": exact_user.get("UserId"),
                 "username": exact_user.get("UserName"),
                 "first_name": exact_user.get("FirstName"),
                 "last_name": exact_user.get("LastName"),
@@ -125,23 +124,23 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
                 )
             }
 
-        # 4. No Exact Match: Format up to 5 candidate options for user selection
-        candidates = []
-        for u in items[:5]:
-            candidates.append({
-                "user_id": u.get("UserId"),
-                "username": u.get("UserName"),
-                "name": f"{u.get('FirstName', '')} {u.get('LastName', '')}".strip(),
-                "email": u.get("EmailAddress")
-            })
+        # 4. No Exact Match: Return only the single top similar candidate without User ID
+        if items:
+            top_match = items[0]
+            display_name = f"{top_match.get('FirstName', '')} {top_match.get('LastName', '')}".strip()
+            matched_username = top_match.get("UserName")
+            matched_email = top_match.get("EmailAddress")
 
-        if candidates:
             return {
                 "found": False,
                 "exact_match_found": False,
-                "status_message": f"Exact user/email '{clean_user}' was not found. Please select from the candidate list below.",
-                "candidate_users": candidates,
-                "instruction": "Present these candidate user options (Username, Name, Email) to the user and ask them to confirm which one they meant."
+                "similar_match": {
+                    "username": matched_username,
+                    "name": display_name,
+                    "email": matched_email
+                },
+                "status_message": f"Exact match for '{clean_user}' not found.",
+                "instruction": f"Ask the user: 'Exact match not found. Did you mean {display_name} ({matched_username})?'"
             }
 
         return {
@@ -160,7 +159,8 @@ async def get_d2l_users_146(username: str = "", domain: str = "") -> dict:
 async def validate_d2l_module_146(org_unit_identifier: str, domain: str = "") -> dict:
     """
     Validate if a D2L Org Unit / Module is valid (IsActive is true AND IsDeleted is false).
-    Checks exact match first. If no exact match exists, searches for related modules and returns candidates to prompt the user.
+    Checks exact match first. If no exact match exists, searches for candidate modules matching the code or base prefix
+    and asks the user to confirm.
     """
     domain = domain or os.environ.get("D2L_DOMAIN", "sp.brightspace.com")
     clean_code = org_unit_identifier.strip()
@@ -205,7 +205,6 @@ async def validate_d2l_module_146(org_unit_identifier: str, domain: str = "") ->
             return {
                 "valid": is_valid,
                 "exact_match_found": True,
-                "org_unit_id": org_unit.get("Identifier"),
                 "name": org_unit.get("Name"),
                 "code": org_unit.get("Code"),
                 "is_active": is_active,
@@ -217,26 +216,49 @@ async def validate_d2l_module_146(org_unit_identifier: str, domain: str = "") ->
                 )
             }
 
-        # 4. No Exact Match: Run Partial/Fuzzy search to pull up to 5 candidates
-        candidates = []
+        # 4. No Exact Match: Perform fallback candidate search
+        candidates_raw = []
         async with httpx.AsyncClient() as client:
-            res = await client.get(search_url, headers=headers, params={"search": clean_code})
+            # Step 4A: Partial match on Code column
+            res = await client.get(search_url, headers=headers, params={"orgUnitCode": clean_code})
             if res.status_code == 200:
-                items = res.json().get("Items", [])
-                for item in items[:5]:
-                    candidates.append({
-                        "org_unit_id": item.get("Identifier"),
-                        "code": item.get("Code"),
-                        "name": item.get("Name")
-                    })
+                candidates_raw = res.json().get("Items", [])
 
-        if candidates:
+            # Step 4B: If 0 results and code contains separator (e.g. MA1108-S2010), search by base code prefix (e.g. MA1108)
+            if not candidates_raw and ("-" in clean_code or "_" in clean_code):
+                base_prefix = clean_code.replace("_", "-").split("-")[0].strip()
+                res = await client.get(search_url, headers=headers, params={"orgUnitCode": base_prefix})
+                if res.status_code == 200:
+                    candidates_raw = res.json().get("Items", [])
+
+            # Step 4C: Broad search fallback if still empty
+            if not candidates_raw:
+                res = await client.get(search_url, headers=headers, params={"search": clean_code})
+                if res.status_code == 200:
+                    candidates_raw = res.json().get("Items", [])
+
+        # Filter candidate list to unique module codes and names without internal IDs
+        candidate_modules = []
+        seen_codes = set()
+        for item in candidates_raw:
+            c_code = item.get("Code", "").strip()
+            c_name = item.get("Name", "").strip()
+            if c_code and c_code.lower() not in seen_codes:
+                seen_codes.add(c_code.lower())
+                candidate_modules.append({
+                    "code": c_code,
+                    "name": c_name
+                })
+            if len(candidate_modules) >= 5:
+                break
+
+        if candidate_modules:
             return {
                 "valid": False,
                 "exact_match_found": False,
-                "status_message": f"Exact module code '{clean_code}' was not found. Please select from the candidate list below.",
-                "candidate_modules": candidates,
-                "instruction": "Present these candidate module options (Code and Name) to the user and ask them to confirm which one they meant."
+                "status_message": f"Exact module code '{clean_code}' was not found in Brightspace.",
+                "candidate_modules": candidate_modules,
+                "instruction": f"Exact match for '{clean_code}' was not found. Ask the user if they meant one of these module codes: {', '.join([c['code'] for c in candidate_modules])}."
             }
 
         return {
