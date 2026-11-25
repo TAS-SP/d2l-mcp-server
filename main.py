@@ -1,447 +1,69 @@
-import asyncio
-import difflib
 import os
 import time
-
 import httpx
-import psycopg
+import difflib
 from fastmcp import FastMCP
-from psycopg.rows import dict_row
-
 
 # Initialize FastMCP Server
 mcp = FastMCP("D2L-v146-Server")
 
-
-# ============================================================
-# D2L authentication configuration
-# ============================================================
-
-D2L_TOKEN_URL = "https://auth.brightspace.com/core/connect/token"
-TOKEN_EXPIRY_BUFFER = 60
-
-
-# Access tokens may remain in memory because they can be recreated.
-# The rotating refresh token is stored permanently in PostgreSQL.
+# In-memory token cache for Render runtime
 TOKEN_CACHE = {
     "access_token": None,
-    "expires_at": 0.0,
+    "expires_at": 0,
+    "current_refresh_token": None
 }
-
-
-# Prevent simultaneous refreshes in the same Python process.
-TOKEN_LOCK = asyncio.Lock()
-
-
-# ============================================================
-# PostgreSQL helpers
-# ============================================================
-
-async def open_database():
-    database_url = os.environ.get("DATABASE_URL", "").strip()
-
-    if not database_url:
-        raise RuntimeError(
-            "DATABASE_URL is missing from the Render environment."
-        )
-
-    return await psycopg.AsyncConnection.connect(
-        database_url,
-        row_factory=dict_row,
-    )
-
-
-async def initialize_token_store() -> None:
-    """
-    Create the PostgreSQL token table.
-
-    If the table does not contain a Brightspace token yet,
-    D2L_REFRESH_TOKEN is inserted as the initial token.
-
-    Existing PostgreSQL tokens are never overwritten by the
-    Render environment variable.
-    """
-
-    initial_refresh_token = os.environ.get(
-        "D2L_REFRESH_TOKEN",
-        "",
-    ).strip()
-
-    if initial_refresh_token.startswith("eyJ"):
-        raise RuntimeError(
-            "D2L_REFRESH_TOKEN appears to be a JWT access token, "
-            "not a Brightspace refresh token."
-        )
-
-    connection = await open_database()
-
-    try:
-        async with connection.transaction():
-            async with connection.cursor() as cursor:
-                await cursor.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS d2l_oauth_tokens (
-                        provider TEXT PRIMARY KEY,
-                        access_token TEXT,
-                        refresh_token TEXT NOT NULL,
-                        expires_at DOUBLE PRECISION NOT NULL DEFAULT 0,
-                        updated_at TIMESTAMPTZ NOT NULL
-                            DEFAULT CURRENT_TIMESTAMP
-                    )
-                    """
-                )
-
-                await cursor.execute(
-                    """
-                    SELECT provider
-                    FROM d2l_oauth_tokens
-                    WHERE provider = %s
-                    """,
-                    ("brightspace",),
-                )
-
-                existing_record = await cursor.fetchone()
-
-                if existing_record is None:
-                    if not initial_refresh_token:
-                        raise RuntimeError(
-                            "No token exists in PostgreSQL and "
-                            "D2L_REFRESH_TOKEN is missing from Render."
-                        )
-
-                    await cursor.execute(
-                        """
-                        INSERT INTO d2l_oauth_tokens (
-                            provider,
-                            access_token,
-                            refresh_token,
-                            expires_at,
-                            updated_at
-                        )
-                        VALUES (
-                            %s,
-                            NULL,
-                            %s,
-                            0,
-                            CURRENT_TIMESTAMP
-                        )
-                        """,
-                        (
-                            "brightspace",
-                            initial_refresh_token,
-                        ),
-                    )
-
-    finally:
-        await connection.close()
-
-
-async def get_stored_tokens() -> dict:
-    """
-    Read the latest Brightspace tokens from PostgreSQL.
-    """
-
-    connection = await open_database()
-
-    try:
-        async with connection.cursor() as cursor:
-            await cursor.execute(
-                """
-                SELECT
-                    access_token,
-                    refresh_token,
-                    expires_at
-                FROM d2l_oauth_tokens
-                WHERE provider = %s
-                """,
-                ("brightspace",),
-            )
-
-            record = await cursor.fetchone()
-
-    finally:
-        await connection.close()
-
-    if record is None:
-        raise RuntimeError(
-            "Brightspace token record was not found in PostgreSQL."
-        )
-
-    return dict(record)
-
-
-# ============================================================
-# D2L token refresh
-# ============================================================
-
-async def refresh_d2l_access_token() -> str:
-    """
-    Exchange the latest persistent refresh token for new tokens.
-
-    PostgreSQL locks the token row while the refresh is taking
-    place. This prevents two concurrent requests from consuming
-    the same one-time Brightspace refresh token.
-    """
-
-    client_id = os.environ.get("D2L_CLIENT_ID", "").strip()
-    client_secret = os.environ.get(
-        "D2L_CLIENT_SECRET",
-        "",
-    ).strip()
-
-    if not client_id or not client_secret:
-        raise RuntimeError(
-            "D2L_CLIENT_ID or D2L_CLIENT_SECRET is missing "
-            "from the Render environment."
-        )
-
-    connection = await open_database()
-
-    new_access_token = None
-    new_expires_at = 0.0
-
-    try:
-        async with connection.transaction():
-            async with connection.cursor() as cursor:
-                await cursor.execute(
-                    """
-                    SELECT
-                        access_token,
-                        refresh_token,
-                        expires_at
-                    FROM d2l_oauth_tokens
-                    WHERE provider = %s
-                    FOR UPDATE
-                    """,
-                    ("brightspace",),
-                )
-
-                record = await cursor.fetchone()
-
-                if record is None:
-                    raise RuntimeError(
-                        "Brightspace token record does not exist."
-                    )
-
-                stored_access_token = record["access_token"]
-
-                stored_refresh_token = str(
-                    record["refresh_token"] or ""
-                ).strip()
-
-                stored_expires_at = float(
-                    record["expires_at"] or 0
-                )
-
-                current_time = time.time()
-
-                # A different request might have refreshed the token
-                # while this request was waiting for the row lock.
-                if (
-                    stored_access_token
-                    and stored_expires_at
-                    > current_time + TOKEN_EXPIRY_BUFFER
-                ):
-                    TOKEN_CACHE["access_token"] = (
-                        stored_access_token
-                    )
-                    TOKEN_CACHE["expires_at"] = (
-                        stored_expires_at
-                    )
-
-                    return stored_access_token
-
-                if not stored_refresh_token:
-                    raise RuntimeError(
-                        "The PostgreSQL refresh token is empty."
-                    )
-
-                if stored_refresh_token.startswith("eyJ"):
-                    raise RuntimeError(
-                        "The token stored in PostgreSQL appears to "
-                        "be a JWT access token, not a refresh token."
-                    )
-
-                # This preserves your current working D2L request
-                # format with client credentials in the form body.
-                payload = {
-                    "grant_type": "refresh_token",
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "refresh_token": stored_refresh_token,
-                }
-
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(30.0)
-                ) as client:
-                    response = await client.post(
-                        D2L_TOKEN_URL,
-                        data=payload,
-                        headers={
-                            "Accept": "application/json",
-                            "Content-Type":
-                                "application/x-www-form-urlencoded",
-                        },
-                    )
-
-                if response.status_code != 200:
-                    try:
-                        error_data = response.json()
-
-                        safe_error = (
-                            error_data.get("error_description")
-                            or error_data.get("error")
-                            or "No error details returned"
-                        )
-                    except Exception:
-                        safe_error = "Non-JSON error response"
-
-                    raise RuntimeError(
-                        "Brightspace token refresh failed. "
-                        f"HTTP {response.status_code}: {safe_error}"
-                    )
-
-                try:
-                    token_data = response.json()
-                except Exception as exc:
-                    raise RuntimeError(
-                        "Brightspace returned an invalid JSON "
-                        "token response."
-                    ) from exc
-
-                new_access_token = token_data.get("access_token")
-                new_refresh_token = token_data.get(
-                    "refresh_token"
-                )
-
-                if not new_access_token:
-                    raise RuntimeError(
-                        "Brightspace did not return an access_token."
-                    )
-
-                if not new_refresh_token:
-                    raise RuntimeError(
-                        "Brightspace did not return a new "
-                        "refresh_token."
-                    )
-
-                try:
-                    expires_in = int(
-                        token_data.get("expires_in", 1800)
-                    )
-                except (TypeError, ValueError):
-                    expires_in = 1800
-
-                expires_in = max(
-                    60,
-                    min(expires_in, 86400),
-                )
-
-                new_expires_at = time.time() + expires_in
-
-                # Persist the newly rotated refresh token before the
-                # database transaction is committed.
-                await cursor.execute(
-                    """
-                    UPDATE d2l_oauth_tokens
-                    SET
-                        access_token = %s,
-                        refresh_token = %s,
-                        expires_at = %s,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE provider = %s
-                    """,
-                    (
-                        new_access_token,
-                        new_refresh_token,
-                        new_expires_at,
-                        "brightspace",
-                    ),
-                )
-
-        # Update memory only after PostgreSQL commits successfully.
-        TOKEN_CACHE["access_token"] = new_access_token
-        TOKEN_CACHE["expires_at"] = new_expires_at
-
-        return new_access_token
-
-    except Exception:
-        TOKEN_CACHE["access_token"] = None
-        TOKEN_CACHE["expires_at"] = 0.0
-        raise
-
-    finally:
-        await connection.close()
-
 
 async def get_valid_access_token() -> str:
     """
-    Return an active Brightspace access token.
-
-    The function checks:
-    1. In-memory access token
-    2. PostgreSQL access token
-    3. PostgreSQL refresh token
+    Retrieve active Bearer token using memory cache or executing single-use refresh token exchange.
     """
+    now = time.time()
+    
+    if TOKEN_CACHE["access_token"] and TOKEN_CACHE["expires_at"] > now + 60:
+        return TOKEN_CACHE["access_token"]
 
-    current_time = time.time()
+    client_id = os.environ.get("D2L_CLIENT_ID")
+    client_secret = os.environ.get("D2L_CLIENT_SECRET")
+    refresh_token = (TOKEN_CACHE["current_refresh_token"] or os.environ.get("D2L_REFRESH_TOKEN", "")).strip()
 
-    cached_access_token = TOKEN_CACHE.get("access_token")
-    cached_expires_at = float(
-        TOKEN_CACHE.get("expires_at", 0) or 0
-    )
+    if not all([client_id, client_secret, refresh_token]):
+        raise ValueError("Missing D2L_CLIENT_ID, D2L_CLIENT_SECRET, or D2L_REFRESH_TOKEN environment variables.")
 
-    if (
-        cached_access_token
-        and cached_expires_at
-        > current_time + TOKEN_EXPIRY_BUFFER
-    ):
-        return cached_access_token
+    if refresh_token.startswith("eyJ"):
+        print("LOG ERROR: D2L_REFRESH_TOKEN starts with 'eyJ'. It is an Access Token (JWT), not a Refresh Token.")
+        raise ValueError("D2L_REFRESH_TOKEN is set to a JWT Access Token instead of an opaque Refresh Token.")
 
-    async with TOKEN_LOCK:
-        # Check again after obtaining the lock.
-        current_time = time.time()
+    token_url = "https://auth.brightspace.com/core/connect/token"
+    payload = {
+        "grant_type": "refresh_token",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token
+    }
 
-        cached_access_token = TOKEN_CACHE.get(
-            "access_token"
-        )
-        cached_expires_at = float(
-            TOKEN_CACHE.get("expires_at", 0) or 0
-        )
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            response = await client.post(token_url, data=payload)
+            if response.status_code != 200:
+                print(f"D2L Auth Error Response ({response.status_code}): {response.text}")
+                
+            response.raise_for_status()
+            data = response.json()
 
-        if (
-            cached_access_token
-            and cached_expires_at
-            > current_time + TOKEN_EXPIRY_BUFFER
-        ):
-            return cached_access_token
+            TOKEN_CACHE["access_token"] = data["access_token"]
+            TOKEN_CACHE["expires_at"] = now + data.get("expires_in", 1800)
+            
+            if "refresh_token" in data:
+                TOKEN_CACHE["current_refresh_token"] = data["refresh_token"]
 
-        # Creates the table and performs the initial migration.
-        await initialize_token_store()
+            return TOKEN_CACHE["access_token"]
 
-        stored_tokens = await get_stored_tokens()
+        except (httpx.TimeoutException, httpx.HTTPStatusError, Exception) as e:
+            TOKEN_CACHE["access_token"] = None
+            TOKEN_CACHE["expires_at"] = 0
+            raise RuntimeError(f"Failed to retrieve access token from D2L: {str(e)}")
 
-        stored_access_token = stored_tokens.get(
-            "access_token"
-        )
-
-        stored_expires_at = float(
-            stored_tokens.get("expires_at", 0) or 0
-        )
-
-        if (
-            stored_access_token
-            and stored_expires_at
-            > time.time() + TOKEN_EXPIRY_BUFFER
-        ):
-            TOKEN_CACHE["access_token"] = (
-                stored_access_token
-            )
-            TOKEN_CACHE["expires_at"] = stored_expires_at
-
-            return stored_access_token
-
-        return await refresh_d2l_access_token()
 
 @mcp.tool()
 async def get_d2l_users_146(
